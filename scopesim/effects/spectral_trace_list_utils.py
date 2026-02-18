@@ -23,6 +23,7 @@ from astropy.io import fits
 from astropy import units as u
 from astropy.wcs import WCS
 from astropy.modeling.models import Polynomial2D
+import os
 
 from ..utils import (power_vector, quantify, from_currsys, close_loop,
                      figure_factory, get_logger)
@@ -218,7 +219,8 @@ class SpectralTrace:
         xmin_mm, ymin_mm = fpa_wcsd.all_pix2world(xmin, ymin, 0)
         xmax_mm, ymax_mm = fpa_wcsd.all_pix2world(xmax, ymax, 0)
 
-        self._set_dispersion(wave_min, wave_max, pixsize=pixsize)
+        dispersion_file = self.meta.get("dispersion_file", None)
+        self._set_dispersion(wave_min, wave_max, dispersionfile=dispersion_file, pixsize=pixsize)
         try:
             xilam = XiLamImage(fov, self.dlam_per_pix)
             self._xilamimg = xilam   # ..todo: remove or make available with a debug flag?
@@ -334,7 +336,8 @@ class SpectralTrace:
         # ..todo: if wcs is given take bin width from cdelt1
         bin_width = kwargs.get("bin_width", None)
         if bin_width is None:
-            self._set_dispersion(wave_min, wave_max)
+            dispersion_file = self.meta.get("dispersion_file", None)
+            self._set_dispersion(wave_min, wave_max, dispersionfile=dispersion_file)
             bin_width = np.abs(self.dlam_per_pix.y).min()
         logger.info("   Bin width %.02g um", bin_width)
 
@@ -610,11 +613,29 @@ class SpectralTrace:
         axes.set_aspect("equal")
         return axes
 
-    def _set_dispersion(self, wave_min, wave_max, pixsize=None):
+    def _set_dispersion(self, wave_min, wave_max, dispersionfile=None, pixsize=None):
         """Compute of dispersion dlam_per_pix along xi=0."""
         # ..todo: This may have to be generalised - xi=0 is at the centre
         # of METIS slits and the short MICADO slit.
 
+        # note that UVEXS_Spectral_Resolution_R2000.txt gives dispersion in nm/pixel per wavelength
+        # try loading the dispersion from the table, but if this fails, compute it from the xy2lam function
+        if dispersionfile is not None:
+            try:
+                from ..utils import find_file
+                dispersionfile_resolved = from_currsys(dispersionfile, self.cmds)
+                if dispersionfile_resolved is not None:
+                    dispersionfile_ = find_file(dispersionfile_resolved)
+                    dispersion_table = np.loadtxt(dispersionfile_, skiprows=2, unpack=True)
+                    # convert to microns and um/pixel
+                    self.dlam_per_pix = interp1d(dispersion_table[0]*1e-3, dispersion_table[2]*1e-3, fill_value="extrapolate")
+                    print(f"Loaded dispersion from file: {dispersionfile_}")
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to load dispersion file '{dispersionfile}': {e}")
+                pass
+        
+        # Fallback: compute dispersion from original scopesim method
         xi = np.array([0] * 1001)
         lam = np.linspace(wave_min, wave_max, 1001)
         x_mm = self.xilam2x(xi, lam)
@@ -628,7 +649,7 @@ class SpectralTrace:
         self.dlam_per_pix = interp1d(lam,
                                      dlam_grad(x_mm, y_mm) * pixsize,
                                      fill_value="extrapolate")
-
+        
     def __repr__(self):
         return f"{self.__class__.__name__}({self.table!r}, **{self.meta!r})"
 
@@ -688,20 +709,36 @@ class XiLamImage():
             dlam_per_pix_val = dlam_per_pix
             logger.warning("Using scalar dlam_per_pix = %.2g",
                            dlam_per_pix_val)
-
+      
         for i, eta in enumerate(cube_eta):
             lam0 = self.lam + dlam_per_pix_val * eta / d_eta
-
             # lam0 is the target wavelength. We need to check that this
             # overlaps with the wavelength range covered by the cube
             if lam0.min() < cube_lam.max() and lam0.max() > cube_lam.min():
                 plane = fov.cube.data[:, i, :].T
-                plane_interp = RectBivariateSpline(cube_xi, cube_lam, plane,
+                # sort cube_xi and cube_lam in increasing order for spline interpolation
+                idx_sort_xi = np.argsort(cube_xi)
+                idx_sort_lam = np.argsort(cube_lam)
+                cube_xi_sorted = cube_xi[idx_sort_xi]
+                cube_lam_sorted = cube_lam[idx_sort_lam]
+               
+                # sort fluxes (plane) and dispersed wavelengths (lam0) accordingly
+                lam0_sorted = lam0[idx_sort_lam]
+                plane_sorted = plane[np.ix_(idx_sort_xi, idx_sort_lam)]
+                
+                plane_interp = RectBivariateSpline(cube_xi_sorted, cube_lam_sorted, plane_sorted,
                                                    kx=1, ky=1)
-                self.image += plane_interp(cube_xi, lam0)
-
+                # evaluate on 2D grid of slit position (xi) and wavelength (lam) values
+                xi_mesh, lam_mesh = np.meshgrid(cube_xi_sorted, lam0_sorted, indexing='ij')
+                plane_result = plane_interp(xi_mesh.ravel(), lam_mesh.ravel(), grid=False).reshape(xi_mesh.shape)
+                # unsort to match the original order
+                inv_idx_xi = np.argsort(idx_sort_xi)
+                inv_idx_lam = np.argsort(idx_sort_lam)
+                result = plane_result[np.ix_(inv_idx_xi, inv_idx_lam)]
+                self.image += result
+      
         self.image *= d_eta     # ph/s/um/arcsec2 --> ph/s/um/arcsec
-
+     
         # WCS for the xi-lambda image, i.e. the rectified 2D spectrum
         # Default WCS with xi in arcsec
         self.wcs = WCS(naxis=2)
