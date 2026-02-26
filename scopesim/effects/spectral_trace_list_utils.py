@@ -23,7 +23,6 @@ from astropy.io import fits
 from astropy import units as u
 from astropy.wcs import WCS
 from astropy.modeling.models import Polynomial2D
-import os
 
 from ..utils import (power_vector, quantify, from_currsys, close_loop,
                      figure_factory, get_logger)
@@ -622,13 +621,16 @@ class SpectralTrace:
         # try loading the dispersion from the table, but if this fails, compute it from the xy2lam function
         if dispersionfile is not None:
             try:
-                from ..utils import find_file
+                from ..utils import find_file, quantity_from_table
                 dispersionfile_resolved = from_currsys(dispersionfile, self.cmds)
                 if dispersionfile_resolved is not None:
                     dispersionfile_ = find_file(dispersionfile_resolved)
-                    dispersion_table = np.loadtxt(dispersionfile_, skiprows=2, unpack=True)
-                    # convert to microns and um/pixel
-                    self.dlam_per_pix = interp1d(dispersion_table[0]*1e-3, dispersion_table[2]*1e-3, fill_value="extrapolate")
+                    dispersion_table = Table.read(dispersionfile_, format='ascii')
+                    wavelengths = quantity_from_table('wavelength', dispersion_table)
+                    dispersions = quantity_from_table('dispersion', dispersion_table)
+                    wavelengths = wavelengths.to(u.um).value
+                    dispersions = dispersions.to(u.um).value # per pixel
+                    self.dlam_per_pix = interp1d(wavelengths, dispersions, fill_value="extrapolate")
                     print(f"Loaded dispersion from file: {dispersionfile_}")
                     return
             except Exception as e:
@@ -712,27 +714,15 @@ class XiLamImage():
       
         for i, eta in enumerate(cube_eta):
             lam0 = self.lam + dlam_per_pix_val * eta / d_eta
+
             # lam0 is the target wavelength. We need to check that this
             # overlaps with the wavelength range covered by the cube
             if lam0.min() < cube_lam.max() and lam0.max() > cube_lam.min():
                 plane = fov.cube.data[:, i, :].T
-                # sort cube_xi and cube_lam in increasing order for spline interpolation
-                idx_sort_xi = np.argsort(cube_xi)
-                idx_sort_lam = np.argsort(cube_lam)
-                cube_xi_sorted = cube_xi[idx_sort_xi]
-                cube_lam_sorted = cube_lam[idx_sort_lam]
-                # sort fluxes (plane) and dispersed wavelengths (lam0) accordingly
-                lam0_sorted = lam0[idx_sort_lam]
-                plane_sorted = plane[np.ix_(idx_sort_xi, idx_sort_lam)]
-                plane_interp = RectBivariateSpline(cube_xi_sorted, cube_lam_sorted, plane_sorted,
-                                                    kx=1, ky=1)
-                plane_result = plane_interp(cube_xi_sorted, lam0_sorted)
-                # unsort to match the original order                    
-                inv_idx_xi = np.argsort(idx_sort_xi)
-                inv_idx_lam = np.argsort(idx_sort_lam)
-                result = plane_result[np.ix_(inv_idx_xi, inv_idx_lam)]
-                self.image += result
-      
+                plane_interp = RectBivariateSpline(cube_xi, cube_lam, plane,
+                                                   kx=1, ky=1)
+                self.image += plane_interp(cube_xi, lam0)
+
         self.image *= d_eta     # ph/s/um/arcsec2 --> ph/s/um/arcsec
      
         # WCS for the xi-lambda image, i.e. the rectified 2D spectrum
