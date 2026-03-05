@@ -1174,7 +1174,7 @@ def extract_range_from_spectrum(spectrum, waverange):
     #     logger.info(
     #         "Waverange does not overlap with Spectrum waveset: %s <> %s for "
     #         "spectrum %s", [wave_min, wave_max], spec_waveset, spectrum)
-    if wave_min < min(spec_waveset) or wave_max > max(spec_waveset):
+    if ((wave_min < min(spec_waveset)) and ~np.isclose(wave_min,min(spec_waveset))) or ((wave_max > max(spec_waveset)) and ~np.isclose(wave_max,max(spec_waveset))):
         logger.info(("Waverange only partially overlaps with Spectrum waveset: "
                      "%s <> %s for spectrum %s"),
                      [wave_min, wave_max], spec_waveset, spectrum)
