@@ -140,6 +140,11 @@ class DetectorList(Effect):
         params = {
             "pixel_scale": "!INST.pixel_scale",  # arcsec
             "active_detectors": "all",
+            # Optional sky-coordinate offset for FoV setup [arcsec]
+            # This shifts the detector footprint used when shrinking the
+            # FovVolumeList during setup (needed for off-axis channels)
+            "fov_x_cen": 0.0,
+            "fov_y_cen": 0.0,
         }
         self.meta.update(params)
         self.meta.update(kwargs)
@@ -212,6 +217,10 @@ class DetectorList(Effect):
         #       refactored to be more consistent everywhere.
         with u.set_enabled_equivalencies(pixel_scale + self.pixel_scale_mm):
             sky_points = (mm_points << u.pixel).to_value(u.arcsec)
+
+        x_cen = float(from_currsys(self.meta.get("fov_x_cen", 0.0), self.cmds))
+        y_cen = float(from_currsys(self.meta.get("fov_y_cen", 0.0), self.cmds))
+        sky_points = sky_points + np.array([x_cen, y_cen])[None, :]
 
         axis = ["x", "y"]
         values = (tuple(zip(sky_points.min(axis=0), sky_points.max(axis=0))))

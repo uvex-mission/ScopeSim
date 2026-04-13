@@ -123,7 +123,7 @@ class GriddedPSF(Effect):
         if not self.oversample_image_flag:
             if epsf.ndim != 2:
                 raise ValueError(f"Expected 2D PSF array, got shape={epsf.shape!r}")
-            # Pad to a multiple of oversampling so we can block-sum efficiently.
+            # Pad to a multiple of oversampling so we can block-sum efficiently
             ny, nx = epsf.shape
             pad_y = (-ny) % psf_oversampling
             pad_x = (-nx) % psf_oversampling
@@ -155,14 +155,14 @@ class GriddedPSF(Effect):
             elif image_oversampling < psf_oversampling:
                 if psf_oversampling % image_oversampling == 0:
                     factor = psf_oversampling // image_oversampling
-                    # Pad to a multiple of the downsampling factor to avoid reshape errors.
+                    # Pad to a multiple of the downsampling factor to avoid reshape errors
                     ny, nx = epsf.shape
                     pad_y = (-ny) % factor
                     pad_x = (-nx) % factor
                     pad_y0, pad_y1 = pad_y // 2, pad_y - pad_y // 2
                     pad_x0, pad_x1 = pad_x // 2, pad_x - pad_x // 2
                     epsf_padded = np.pad(epsf, ((pad_y0, pad_y1), (pad_x0, pad_x1)), mode="constant", constant_values=0.0)
-                    psf_sampled = self.downsample(epsf_padded, f=factor)
+                    psf_sampled = self._downsample(epsf_padded, f=factor)
                     psf_sum = psf_sampled.sum()
                     if np.isfinite(psf_sum) and psf_sum > 0:
                         psf_sampled /= psf_sum
@@ -181,7 +181,7 @@ class GriddedPSF(Effect):
             logger.warning(f"PSF at image pixel location ({xi}, {yi}) is invalid")
         return epsf_sampled
         
-    def oversample(self, img, f=None):
+    def _oversample(self, img, f=None):
         if f is None:
             oversampling = int(self.oversampling)
         else:
@@ -201,7 +201,7 @@ class GriddedPSF(Effect):
                 logger.warning("Flux is not conserved by oversampling: difference is %.2f%%", rel_diff * 100)
         return new_img
         
-    def downsample(self, img, f=None):
+    def _downsample(self, img, f=None):
         if f is None:
             oversampling = int(self.oversampling)
         else:
@@ -273,7 +273,7 @@ class SlitPSF(GriddedPSF):
             cube_wcs = WCS(obj.hdu.header)
             
             if self.oversample_image_flag:
-                image = self.oversample(obj.hdu.data.astype(np.float32))
+                image = self._oversample(obj.hdu.data.astype(np.float32))
                 tile_size *= int(self.oversampling)
             else: 
                 image = obj.hdu.data.astype(float)
@@ -366,7 +366,7 @@ class SlitPSF(GriddedPSF):
                 logger.warning(f"Flux is not conserved by LSS slit PSF convolution: difference is {np.abs(image.sum()-convolved_image.sum())/image.sum()*100:.2f}%")
             
             if self.oversample_image_flag:
-                final_image = self.downsample(convolved_image + bkg_level)
+                final_image = self._downsample(convolved_image + bkg_level)
             else:
                 final_image = convolved_image + bkg_level
             obj.hdu.data = final_image
@@ -416,7 +416,7 @@ class LSSDetectorPSF(GriddedPSF):
             # If oversampling is enabled, oversample the maps and use tile size in oversampled pixels
             if self.oversample_image_flag:
                 oversampling = int(self.oversampling)
-                image = self.oversample(obj.hdu.data.astype(np.float32))
+                image = self._oversample(obj.hdu.data.astype(np.float32))
                 ydim, xdim = image.shape
                 tile_size *= oversampling
                 xi_map = np.repeat(np.repeat(obj.hdu.xi_map, oversampling, axis=0), oversampling, axis=1)
@@ -506,7 +506,7 @@ class LSSDetectorPSF(GriddedPSF):
                     logger.warning("Flux is not conserved by LSS detector PSF convolution: difference is %.2f%%",rel_diff * 100) 
             
             if self.oversample_image_flag:
-                final_image = self.downsample(convolved_image + bkg_level)
+                final_image = self._downsample(convolved_image + bkg_level)
             else:
                 final_image = convolved_image + bkg_level
             obj.hdu.data = final_image
