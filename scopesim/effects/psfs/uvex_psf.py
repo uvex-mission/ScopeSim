@@ -29,7 +29,8 @@ class GriddedPSF(Effect):
         params = {
             "bkg_width": 0, # No background subtraction by default: see psf_base.get_bkg_level for details
             "flux_accuracy": 1e-4,
-            "psf_oversampling": 10
+            "psf_oversampling": 10,
+            "fov_x0": 3.5 # in deg, note that this is slightly redundant with fov_x_cen in UVIM_DET_LSS
         }
         self.meta.update(params)
         self.meta = from_currsys(self.meta, self.cmds)
@@ -242,7 +243,7 @@ class SlitPSF(GriddedPSF):
                 x_field = float(hdul[0].header['XFLD']) # deg
                 slit_positions.append(y_field)
         
-        x_pos = [-1.*u.arcsec.to(u.deg), 0., 1.*u.arcsec.to(u.deg)]
+        x_pos = np.array([-1.*u.arcsec.to(u.deg), 0., 1.*u.arcsec.to(u.deg)]) + self.meta["fov_x0"]
         grid_xypos: list[tuple[float, float]] = []
         for _, slit_pos in enumerate(slit_positions):
             for j in range(3):
@@ -515,6 +516,11 @@ class LSSDetectorPSF(GriddedPSF):
         
 def find_directory(dir_name, search_root="."):
     """Find directory by name and return its absolute path."""
+    if dir_name is None:
+        return None
+    # check if the input path is already a valid directory
+    if os.path.isdir(dir_name):
+        return os.path.abspath(dir_name)
     for root, dirs, files in os.walk(search_root):
         if dir_name in dirs:
             return os.path.abspath(os.path.join(root, dir_name))
