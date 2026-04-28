@@ -133,7 +133,7 @@ class GriddedPSF(Effect):
             epsf_padded = np.pad(epsf, ((pad_y0, pad_y1), (pad_x0, pad_x1)), mode="constant", constant_values=0.0)
             new_ny = epsf_padded.shape[0] // psf_oversampling
             new_nx = epsf_padded.shape[1] // psf_oversampling
-            # Block-sum: (new_ny, os, new_nx, os) -> (new_ny, new_nx)
+            # (new_ny, os, new_nx, os) -> (new_ny, new_nx)
             psf_sampled = epsf_padded.reshape(new_ny, psf_oversampling, new_nx, psf_oversampling).sum(axis=(1, 3))
             # Renormalize after downsampling
             psf_sum = psf_sampled.sum()
@@ -265,7 +265,7 @@ class SlitPSF(GriddedPSF):
                 waveset_edges = 0.5 * (waveset[:-1] + waveset[1:])
                 obj.split("wave", quantify(waveset_edges, u.um).value)
            
-        if isinstance(obj, self.convolution_classes):
+        elif isinstance(obj, self.convolution_classes):
             logger.debug("UVEX LSS slit PSF convolution start")
             assert obj.hdu.data.ndim == 3 # not mapped to detector plane yet
             if tile_size > obj.hdu.data.shape[1] or tile_size > obj.hdu.data.shape[2]:
@@ -279,7 +279,7 @@ class SlitPSF(GriddedPSF):
             else: 
                 image = obj.hdu.data.astype(float)
             
-            n_lambda, n_y, n_x = image.shape
+            _, n_y, n_x = image.shape
             # subtract background level before convolution and add back after
             bkg_level = get_bkg_level(image, self.meta["bkg_width"])
             if self.meta["bkg_width"] == 0:
@@ -306,66 +306,75 @@ class SlitPSF(GriddedPSF):
             n_tiles_spat = n_spat // tile_size + (1 if n_spat % tile_size != 0 else 0)
             
             convolved_image = np.zeros_like(image)
-            with tqdm(desc=" Slit PSF Convolution") as pbar:
-                for l in range(n_lambda):
-                    for x in range(n_tiles_spec):
-                        for y in range(n_tiles_spat):
-                            x0 = x * tile_size # tile start index
-                            x1 = min((x+1)*tile_size, n_spec) # tile end in pixels (don't go outside the image)
-                            y0 = y * tile_size
-                            y1 = min((y+1)*tile_size, n_spat)
+            with tqdm(total=n_tiles_spec*n_tiles_spat, desc=" Slit PSF Convolution") as pbar:
+                for x in range(n_tiles_spec):
+                    for y in range(n_tiles_spat):
+                        x0 = x * tile_size # tile start index
+                        x1 = min((x+1)*tile_size, n_spec) # tile end in pixels (don't go outside the image)
+                        y0 = y * tile_size
+                        y1 = min((y+1)*tile_size, n_spat)
 
-                            x_cen = min(x0 + (x1 - x0) // 2, n_spec - 1)
-                            y_cen = min(y0 + (y1 - y0) // 2, n_spat - 1)
+                        x_cen = min(x0 + (x1 - x0) // 2, n_spec - 1)
+                        y_cen = min(y0 + (y1 - y0) // 2, n_spat - 1)
                             
-                            # Corresponding field coordinates for the PSF center
-                            x_fld0 = float(xi_img[x_cen])
-                            y_fld0 = float(slit_y_img[y_cen])
-                            # Clamp to PSF grid bounds if necessary, so tiles beyond the PSF grid will just get mapped to the edge PSFs
-                            x_fld0 = np.clip(x_fld0, self.x_min, self.x_max)
-                            y_fld0 = np.clip(y_fld0, self.y_min, self.y_max)
+                        # Corresponding field coordinates for the PSF center
+                        x_fld0 = float(xi_img[x_cen])
+                        y_fld0 = float(slit_y_img[y_cen])
+                        # Clamp to PSF grid bounds if necessary, so tiles beyond the PSF grid will just get mapped to the edge PSFs
+                        x_fld0 = np.clip(x_fld0, self.x_min, self.x_max)
+                        y_fld0 = np.clip(y_fld0, self.y_min, self.y_max)
                         
-                            # Get the effective PSF convolution kernel for this tile
-                            ePSF = self._ePSF(x_fld0, y_fld0)
-                            
-                            # Basic overlap add logic: zero pad the image tile by PSF size - 1 on each side to avoid edge effects in convolution
-                            pad_y = ePSF.shape[0] - 1
-                            pad_x = ePSF.shape[1] - 1
-                            orig_tile = image[l, y*tile_size:(y+1)*tile_size, x*tile_size:(x+1)*tile_size]
+                        # Get the effective PSF for the tile center
+                        ePSF = self._ePSF(x_fld0, y_fld0)
                         
-                            if orig_tile.shape[0] != tile_size or orig_tile.shape[1] != tile_size:
-                                pad_x_orig = tile_size - orig_tile.shape[1]
-                                pad_y_orig = tile_size - orig_tile.shape[0]
-                                tile = np.pad(orig_tile, ((0, pad_y_orig), (0, pad_x_orig)), mode='constant', constant_values=0.)
-                            else:
-                                tile = orig_tile
+                        # Add wavelength axis to convolve all wavelength slices at once
+                        kernel_3d = ePSF[None, :, :]
+                        # Basic overlap add logic: zero pad the image tile by PSF size - 1 on each side to avoid edge effects in convolution
+                        pad_y = ePSF.shape[0] - 1
+                        pad_x = ePSF.shape[1] - 1
+                        orig_tile = image[:, y*tile_size:(y+1)*tile_size, x*tile_size:(x+1)*tile_size]
+                        
+                        if orig_tile.shape[1] != tile_size or orig_tile.shape[2] != tile_size:
+                            pad_x_orig = tile_size - orig_tile.shape[2]
+                            pad_y_orig = tile_size - orig_tile.shape[1]
+                            tile = np.pad(orig_tile, ((0, 0), (0, pad_y_orig), (0, pad_x_orig)), mode='constant', constant_values=0.)
+                        else:
+                            tile = orig_tile
                             
-                            padded_image = np.pad(tile, ((pad_y, pad_y), (pad_x, pad_x)), mode='constant', constant_values=((0.,0.), (0.,0.)))
-                            convolved_image_ij = fftconvolve(padded_image, ePSF, mode='same')
-                            
-                            # Absolute detector image indices covered by the convolved patch
-                            g_y0 = y0 - pad_y
-                            g_y1 = y0 + tile_size + pad_y
-                            g_x0 = x0 - pad_x
-                            g_x1 = x0 + tile_size + pad_x
-                            # Detector image indices trimmed to image bounds
-                            cminy = max(0, g_y0)
-                            cmaxy = min(n_spat, g_y1)
-                            cminx = max(0, g_x0)
-                            cmaxx = min(n_spec, g_x1)
-                            # Convolved image tile indices
-                            start_y = cminy - g_y0
-                            end_y = start_y + (cmaxy - cminy)
-                            start_x = cminx - g_x0
-                            end_x = start_x + (cmaxx - cminx)
+                        padded_image = np.pad(tile, ((0, 0), (pad_y, pad_y), (pad_x, pad_x)), mode='constant', constant_values=0.)
+                        # Note that using fftconvolve here might not the most efficient route since there is some N-d convolution overhead
+                        # however this handles kernel centering automatically as opposed to, e.g., doing the convolution in Fourier space with scipy.fft
+                        convolved_image_ij = fftconvolve(padded_image, kernel_3d, mode='same')
+                        
+                        # Absolute detector image indices covered by the convolved patch
+                        g_y0 = y0 - pad_y
+                        g_y1 = y0 + tile_size + pad_y
+                        g_x0 = x0 - pad_x
+                        g_x1 = x0 + tile_size + pad_x
+                        # Detector image indices trimmed to image bounds
+                        cminy = max(0, g_y0)
+                        cmaxy = min(n_spat, g_y1)
+                        cminx = max(0, g_x0)
+                        cmaxx = min(n_spec, g_x1)
+                        # Convolved image tile indices
+                        start_y = cminy - g_y0
+                        end_y = start_y + (cmaxy - cminy)
+                        start_x = cminx - g_x0
+                        end_x = start_x + (cmaxx - cminx)
 
-                            convolved_image_cen = convolved_image_ij[start_y:end_y, start_x:end_x]
-                            convolved_image[l, cminy:cmaxy, cminx:cmaxx] += convolved_image_cen
+                        convolved_image_cen = convolved_image_ij[:, start_y:end_y, start_x:end_x]
+                        convolved_image[:, cminy:cmaxy, cminx:cmaxx] += convolved_image_cen
                         
-                    pbar.update(x*n_tiles_spat)
-            if (np.abs(image.sum()-convolved_image.sum())/image.sum()) > self.meta["flux_accuracy"]:
-                logger.warning(f"Flux is not conserved by LSS slit PSF convolution: difference is {np.abs(image.sum()-convolved_image.sum())/image.sum()*100:.2f}%")
+                        if y % 32 == 0:
+                            pbar.update(32)
             
+            img_sum = image.sum()
+            conv_sum = convolved_image.sum()
+            if np.isfinite(img_sum) and img_sum != 0:
+                rel_diff = np.abs(img_sum - conv_sum) / np.abs(img_sum)
+                if rel_diff > self.meta["flux_accuracy"]:
+                    logger.warning("Flux is not conserved by slit PSF convolution: difference is %.2f%%",rel_diff * 100)        
+             
             if self.oversample_image_flag:
                 final_image = self._downsample(convolved_image + bkg_level)
             else:
@@ -441,7 +450,7 @@ class LSSDetectorPSF(GriddedPSF):
             # Add 1 if pixel extent does not perfectly divide tile size to capture partial tiles at the edges
             n_tiles_y = ydim // tile_size + (1 if ydim % tile_size != 0 else 0)
             n_tiles_x = xdim // tile_size + (1 if xdim % tile_size != 0 else 0)
-            with tqdm(desc=" LSS Detector PSF Convolution") as pbar:
+            with tqdm(total=n_tiles_y*n_tiles_x, desc=" LSS Detector PSF Convolution") as pbar:
                 for y in range(n_tiles_y):
                     for x in range(n_tiles_x):
                         y0 = y * tile_size # tile start in pixels (index into detector image)
@@ -475,7 +484,7 @@ class LSSDetectorPSF(GriddedPSF):
                         else:
                             tile = orig_tile
                         
-                        padded_image = np.pad(tile, ((pad_y, pad_y), (pad_x, pad_x)), mode='constant', constant_values=((0.,0.), (0.,0.)))
+                        padded_image = np.pad(tile, ((pad_y, pad_y), (pad_x, pad_x)), mode='constant', constant_values=0.)
                         convolved_image_ij = fftconvolve(padded_image, ePSF, mode='same')
                         
                         # Absolute detector image indices covered by the convolved patch
@@ -497,7 +506,8 @@ class LSSDetectorPSF(GriddedPSF):
                         convolved_image_cen = convolved_image_ij[start_y:end_y, start_x:end_x]
                         convolved_image[cminy:cmaxy, cminx:cmaxx] += convolved_image_cen
                         
-                    pbar.update(y*n_tiles_x)
+                        if x % 32 == 0:
+                            pbar.update(32)
 
             img_sum = image.sum()
             conv_sum = convolved_image.sum()
