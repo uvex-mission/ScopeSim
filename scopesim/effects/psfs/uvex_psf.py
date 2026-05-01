@@ -106,12 +106,14 @@ class GriddedPSF(Effect):
         psf_x1_y1 = self.psfs[urid]
         
         # Pad to make sure all PSFs have the same size
-        # we assume the PSF centers are all aligned at roughly the same pixel and that the PSF shapes are square
         max_psf_size = max(psf_x0_y0.shape[0], psf_x0_y1.shape[0], psf_x1_y0.shape[0], psf_x1_y1.shape[0])
         psf_arr = []
         for _, psf in enumerate([psf_x0_y0, psf_x0_y1, psf_x1_y0, psf_x1_y1]):
             if psf.shape[0] < max_psf_size:
-                psf = np.pad(psf, ((0, max_psf_size - psf.shape[0]), (0, max_psf_size - psf.shape[1])), mode='constant', constant_values=(0., 0.))
+                # The PSFs are centered, so pad symmetrically (this is presumably by construction for the current libraries)
+                pad_left = (max_psf_size - psf.shape[0]) // 2
+                pad_right = max_psf_size - pad_left - psf.shape[0]
+                psf = np.pad(psf, ((pad_left, pad_right), (pad_left, pad_right)), mode='constant', constant_values=0.)
             psf_arr.append(psf)
         
         psf_x0_y0, psf_x0_y1, psf_x1_y0, psf_x1_y1 = psf_arr
@@ -183,6 +185,7 @@ class GriddedPSF(Effect):
         return epsf_sampled
         
     def _oversample(self, img, f=None):
+        """Oversample an input image by either the image oversampling factor or a custom factor f."""
         if f is None:
             oversampling = int(self.oversampling)
         else:
@@ -203,6 +206,7 @@ class GriddedPSF(Effect):
         return new_img
         
     def _downsample(self, img, f=None):
+        """Downsample an input image by either the image oversampling factor or a custom factor f."""
         if f is None:
             oversampling = int(self.oversampling)
         else:
@@ -231,11 +235,14 @@ class SlitPSF(GriddedPSF):
     z_order: ClassVar[tuple[int, ...]] = (231, 631)
 
     def __init__(self, **kwargs):
+        """
+        Initialize the SlitPSF effect (load the PSF library, set up grid for interpolation, etc.)
+        Note: this currently assumes the input field coordinates are in deg.
+        """
         super().__init__(**kwargs)
-        # For use with our interpolator, we will copy the PSF arrays into a second dimension
         arrs: list[np.ndarray] = []
         slit_positions: list[float] = []
-        for psf_file in sorted(self.psf_lib):
+        for psf_file in self.psf_lib:
             with fits.open(os.path.join(self.psf_dir, psf_file)) as hdul:
                 arr = hdul[0].data / hdul[0].data.sum()
                 arrs.append(arr)
@@ -243,6 +250,12 @@ class SlitPSF(GriddedPSF):
                 x_field = float(hdul[0].header['XFLD']) # deg
                 slit_positions.append(y_field)
         
+        # Sort slit positions and PSF array so the PSFs lie on a regular grid
+        sortidx = np.argsort(slit_positions, kind='stable')
+        slit_positions = np.array(slit_positions)[sortidx]
+        arrs = [arrs[i] for i in sortidx]
+        
+        # For use with our interpolator, we will copy the PSF arrays into a second dimension
         x_pos = np.array([-1.*u.arcsec.to(u.deg), 0., 1.*u.arcsec.to(u.deg)]) + self.meta["fov_x0"]
         grid_xypos: list[tuple[float, float]] = []
         for _, slit_pos in enumerate(slit_positions):
@@ -265,6 +278,7 @@ class SlitPSF(GriddedPSF):
                 waveset_edges = 0.5 * (waveset[:-1] + waveset[1:])
                 obj.split("wave", quantify(waveset_edges, u.um).value)
            
+        # 2. During observation (where the convolution happens)
         elif isinstance(obj, self.convolution_classes):
             logger.debug("UVEX LSS slit PSF convolution start")
             assert obj.hdu.data.ndim == 3 # not mapped to detector plane yet
@@ -273,6 +287,7 @@ class SlitPSF(GriddedPSF):
             
             cube_wcs = WCS(obj.hdu.header)
             
+            # Oversample the image if requested
             if self.oversample_image_flag:
                 image = self._oversample(obj.hdu.data.astype(np.float32))
                 tile_size *= int(self.oversampling)
@@ -280,7 +295,7 @@ class SlitPSF(GriddedPSF):
                 image = obj.hdu.data.astype(float)
             
             _, n_y, n_x = image.shape
-            # subtract background level before convolution and add back after
+            # Subtract background level before convolution and add back after
             bkg_level = get_bkg_level(image, self.meta["bkg_width"])
             if self.meta["bkg_width"] == 0:
                 bkg_level = bkg_level[:, None, None]
@@ -386,12 +401,14 @@ class LSSDetectorPSF(GriddedPSF):
     z_order: ClassVar[tuple[int, ...]] = (273, 673)
 
     def __init__(self, **kwargs):
+        """
+        Initialize the LSSDetectorPSF effect (load the PSF library, set up grid for interpolation, etc.)
+        Note: this currently assumes the input wavelengths are in nm, and field positions are in deg.
+        """
         super().__init__(**kwargs)
-        """Note: this currently assumes the input wavelengths are in nm,
-        and field positions are in deg."""
         arrs: list[np.ndarray] = []
         positions: list[tuple[float, float]] = []
-        for psf_file in sorted(self.psf_lib):
+        for psf_file in self.psf_lib:
             with fits.open(os.path.join(self.psf_dir, psf_file)) as hdul:
                 arr = hdul[0].data / hdul[0].data.sum() # normalize
                 arrs.append(arr)
@@ -399,6 +416,13 @@ class LSSDetectorPSF(GriddedPSF):
                 y_field = float(hdul[0].header['YFLD']) * 3600.  # convert from deg to arcsec
                 # x = wavelength, y = field position
                 positions.append((lam, y_field))
+        
+        # Sort PSF grid by y field position, then by wavelength
+        x, y = np.array(positions)[:,0], np.array(positions)[:,1]
+        sortidx = np.lexsort((x, y))
+        x, y = x[sortidx], y[sortidx]
+        arrs = [arrs[i] for i in sortidx]
+        positions = [positions[i] for i in sortidx]
         
         self.psfs = arrs
         self.grid_xypos = np.asarray(positions) # shape N x 2
