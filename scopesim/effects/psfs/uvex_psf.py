@@ -39,10 +39,11 @@ class GriddedPSF(Effect):
         super().__init__(**kwargs)
         params = {
             "bkg_width": 0.0, # No background subtraction by default: see psf_base.get_bkg_level for details
-            "flux_accuracy": 1e-4,
-            "psf_oversampling": 10,
+            "flux_accuracy": "!SIM.computing.flux_accuracy",
+            "psf_oversampling": "!SIM.computing.psf_oversampling",
             "oversampling_x": "!SIM.computing.oversampling_x",
             "oversampling_y": "!SIM.computing.oversampling_y",
+            "tile_size": "!SIM.computing.tile_size",
             "fov_x0": "!INST.fov_x0",
             "fov_y0": "!INST.fov_y0",
             "fov_unit": "!INST.fov_unit",
@@ -54,6 +55,7 @@ class GriddedPSF(Effect):
         self.psf_lib = self._load_psf_files()
         self.oversampling_x = self.meta.get("oversampling_x", 1)
         self.oversampling_y = self.meta.get("oversampling_y", 1)
+        self.tile_size = self.meta.get("tile_size", 32)
         self._waveset = []
         self.convolution_classes = (FieldOfView, ImagePlane)
         self.psfs: list[np.ndarray] | np.ndarray = None
@@ -175,16 +177,16 @@ class GriddedPSF(Effect):
             if image_oversampling_x > psf_oversampling:
                 raise ValueError(
                     f"Image oversampling_x factor {image_oversampling_x} is larger than PSF oversampling factor {psf_oversampling}; "
-                    "upsampling PSFs requires interpolation and is not supported by block-sum resampling."
+                    "upsampling PSFs requires interpolation which is not supported."
                 )
             if image_oversampling_y > psf_oversampling:
                 raise ValueError(
                     f"Image oversampling_y factor {image_oversampling_y} is larger than PSF oversampling factor {psf_oversampling}; "
-                    "upsampling PSFs requires interpolation and is not supported by block-sum resampling."
+                    "upsampling PSFs requires interpolation which is not supported."
                 )
             # If the image oversampling is different from the PSF oversampling, we can downsample the PSF by the ratio of the oversampling factors
             # Not guaranteed to work if the oversampling factors are not integer multiples, so the program aborts
-            elif image_oversampling_x < psf_oversampling and image_oversampling_y < psf_oversampling:
+            if image_oversampling_x < psf_oversampling or image_oversampling_y < psf_oversampling:
                 if psf_oversampling % image_oversampling_x == 0 and psf_oversampling % image_oversampling_y == 0:
                     factor_x = psf_oversampling // image_oversampling_x
                     factor_y = psf_oversampling // image_oversampling_y
@@ -214,48 +216,6 @@ class GriddedPSF(Effect):
         if (not np.isfinite(psf_sum)) or (psf_sum <= 0.):
             logger.warning(f"PSF at image pixel location ({xi}, {yi}) is invalid")
         return epsf_sampled
-        
-    def _oversample(self, img, f=None):
-        """Oversample an input image by either the image oversampling factors or a custom factor f."""
-        if f is None:
-            oversampling_x = int(self.oversampling_x)
-            oversampling_y = int(self.oversampling_y)
-        else:
-            oversampling_x = f[0]
-            oversampling_y = f[1]
-        logger.debug("Oversampling image by factor of %d in x direction and %s in y direction", oversampling_x, oversampling_y)
-        if img.ndim == 3: # Flux density. TODO: add BUNIT check
-            if oversampling_y == 1 and oversampling_x != 1:
-                new_img = np.repeat(img, oversampling_x, axis=2) # x only
-            elif oversampling_y != 1 and oversampling_x == 1:
-                new_img = np.repeat(img, oversampling_y, axis=1) # y only
-            elif oversampling_x != 1 and oversampling_y != 1:
-                new_img = np.repeat(np.repeat(img, oversampling_y, axis=1), oversampling_x, axis=2)
-            else:
-                new_img = img
-        elif img.ndim == 2: # Electrons. TODO: add BUNIT check
-            if oversampling_y == 1 and oversampling_x != 1:
-                oversampled_image = np.repeat(img, oversampling_x, axis=1) # x only
-                new_img = oversampled_image / oversampling_x
-            elif oversampling_y != 1 and oversampling_x == 1:
-                oversampled_image = np.repeat(img, oversampling_y, axis=0) # y only
-                new_img = oversampled_image / oversampling_y
-            elif oversampling_x != 1 and oversampling_y != 1:
-                oversampled_image = np.repeat(np.repeat(img, oversampling_y, axis=0), oversampling_x, axis=1)
-                new_img = oversampled_image / (oversampling_x * oversampling_y)
-            else:
-                new_img = img
-
-        # check flux conservation after oversampling + normalization
-        img_sum = img.sum()
-        new_sum = new_img.sum()
-        if img.ndim == 3:
-            new_sum /= (self.oversampling_x * self.oversampling_y)
-        if np.isfinite(img_sum) and img_sum != 0:
-            rel_diff = np.abs(img_sum - new_sum) / np.abs(img_sum)
-            if rel_diff > self.meta["flux_accuracy"]:
-                logger.warning("Flux is not conserved by oversampling: difference is %.2f%%", rel_diff * 100)
-        return new_img
         
     def _downsample(self, img, f=None):
         """Downsample an input image by either the image oversampling factors or a custom factor f."""
@@ -327,7 +287,7 @@ class SlitPSF(GriddedPSF):
         slit_positions = np.array(slit_positions)[sortidx]
         arrs = [arrs[i] for i in sortidx]
         
-        # For use with our interpolator, we will copy the PSF arrays into a second dimension
+        # For use with our interpolator, we will copy the PSF arrays into a second dimension. hmmm, is this the best way?
         x_pos = np.array([-1.*u.arcsec.to(u.deg), 0., 1.*u.arcsec.to(u.deg)]) + self.fov_x0.to(u.deg).value
         grid_xypos: list[tuple[float, float]] = []
         for _, slit_pos in enumerate(slit_positions):
@@ -342,7 +302,8 @@ class SlitPSF(GriddedPSF):
         self.y_min, self.y_max = self.y_vals.min(), self.y_vals.max()
         self.max_psf_size = max([psf.shape[0] for psf in self.psfs])
         
-    def apply_to(self, obj, tile_size_x=32, tile_size_y=32, **kwargs):
+    def apply_to(self, obj, **kwargs): 
+        tile_size_x, tile_size_y = 32, 32 # hardcoded at 32 because this is more than enough to capture the slit
         # 1. During setup of the FieldOfViews
         if isinstance(obj, FovVolumeList) and self._waveset is not None:
             logger.debug("Executing %s, FoV setup", self.meta['name'])
@@ -356,10 +317,6 @@ class SlitPSF(GriddedPSF):
             logger.debug("UVEX LSS slit PSF convolution start")
             assert obj.hdu.data.ndim == 3, "Data dimensions should be 3D; check FOV creation and effect ordering." # not mapped to detector plane yet
 
-            os_state = getattr(obj, "_oversampled", None)
-            if self.oversampling_x != 1 or self.oversampling_y != 1:
-                if os_state is None:
-                    raise ValueError("Either oversampling_x or oversampling_y is greater than 1, but the Oversampling effect has not been applied to the image yet; aborting.")
             tile_size_x *= self.oversampling_x
             tile_size_y *= self.oversampling_y
             if tile_size_y > obj.hdu.data.shape[1] or tile_size_x > obj.hdu.data.shape[2]:
@@ -374,37 +331,38 @@ class SlitPSF(GriddedPSF):
             if self.meta["bkg_width"] == 0:
                 bkg_level = bkg_level[:, None, None]
             image -= bkg_level
+
+            # Get the physical extent. Important b/c if theres different oversampling factors,
+            # only the physical, not pixel, extent can distinguish the spectral (longer) axis
+            extent_x = n_x * abs(obj.hdu.header["CDELT1"]) * u.Unit(obj.hdu.header["CUNIT1"]).to(u.arcsec)
+            extent_y = n_y * abs(obj.hdu.header["CDELT2"]) * u.Unit(obj.hdu.header["CUNIT2"]).to(u.arcsec) 
             
-            if n_y > n_x: # across slit (spectral) direction is n_x
+            if extent_x <= extent_y: # across slit (spectral) direction is x
                 wcs_y = cube_wcs.sub([2])
                 slit_y_img =  wcs_y.all_pix2world(np.arange(n_y), 0)[0] * u.Unit(wcs_y.wcs.cunit[0]).to(u.Unit(obj.hdu.header["CUNIT2"]))
                 wcs_xi = cube_wcs.sub([1])
                 xi_img = wcs_xi.all_pix2world(np.arange(n_x), 0)[0] * u.Unit(wcs_xi.wcs.cunit[0]).to(u.Unit(obj.hdu.header["CUNIT1"]))
-                n_spec = n_x
-                n_spat = n_y
                 
             else: # spectral direction is n_y or second axis
                 wcs_xi = cube_wcs.sub([2])
                 xi_img =  wcs_xi.all_pix2world(np.arange(n_y), 0)[0] * u.Unit(wcs_xi.wcs.cunit[0]).to(u.Unit(obj.hdu.header["CUNIT2"]))
                 wcs_y = cube_wcs.sub([1])
                 slit_y_img = wcs_y.all_pix2world(np.arange(n_x), 0)[0] * u.Unit(wcs_y.wcs.cunit[0]).to(u.Unit(obj.hdu.header["CUNIT1"]))
-                n_spec = n_y
-                n_spat = n_x
             
-            n_tiles_spec = n_spec // tile_size_x + (1 if n_spec % tile_size_x != 0 else 0)
-            n_tiles_spat = n_spat // tile_size_y + (1 if n_spat % tile_size_y != 0 else 0)
+            n_tiles_x = n_x // tile_size_x + (1 if n_x % tile_size_x != 0 else 0)
+            n_tiles_y = n_y // tile_size_y + (1 if n_y % tile_size_y != 0 else 0)
             
             convolved_image = np.zeros_like(image)
-            with tqdm(total=n_tiles_spec*n_tiles_spat, desc=" Slit PSF Convolution") as pbar:
-                for x in range(n_tiles_spec):
-                    for y in range(n_tiles_spat):
+            with tqdm(total=n_tiles_x*n_tiles_y, desc=" Slit PSF Convolution") as pbar:
+                for x in range(n_tiles_x):
+                    for y in range(n_tiles_y):
                         x0 = x * tile_size_x # tile start index
-                        x1 = min((x+1)*tile_size_x, n_spec) # tile end in pixels (don't go outside the image)
+                        x1 = min((x+1)*tile_size_x, n_x) # tile end in pixels (don't go outside the image)
                         y0 = y * tile_size_y
-                        y1 = min((y+1)*tile_size_y, n_spat)
+                        y1 = min((y+1)*tile_size_y, n_y)
 
-                        x_cen = min(x0 + (x1 - x0) // 2, n_spec - 1)
-                        y_cen = min(y0 + (y1 - y0) // 2, n_spat - 1)
+                        x_cen = min(x0 + (x1 - x0) // 2, n_x - 1)
+                        y_cen = min(y0 + (y1 - y0) // 2, n_y - 1)
                             
                         # Corresponding field coordinates for the PSF center
                         x_fld0 = float(xi_img[x_cen])
@@ -442,9 +400,9 @@ class SlitPSF(GriddedPSF):
                         g_x1 = x0 + tile_size_x + pad_x
                         # Detector image indices trimmed to image bounds
                         cminy = max(0, g_y0)
-                        cmaxy = min(n_spat, g_y1)
+                        cmaxy = min(n_y, g_y1)
                         cminx = max(0, g_x0)
-                        cmaxx = min(n_spec, g_x1)
+                        cmaxx = min(n_x, g_x1)
                         # Convolved image tile indices
                         start_y = cminy - g_y0
                         end_y = start_y + (cmaxy - cminy)
@@ -510,8 +468,10 @@ class LSSDetectorPSF(GriddedPSF):
         self.y_min, self.y_max = self.y_vals.min(), self.y_vals.max()
         self.max_psf_size = max([psf.shape[0] for psf in self.psfs])
         
-    def apply_to(self, obj, tile_size_x=32, tile_size_y=32, **kwargs): 
-        # TODO: adaptive resolution based on position in the FOV? Only because the red end PSFs degrade rapidly
+    def apply_to(self, obj, **kwargs): 
+        # TODO: adaptive resolution based on position in the FOV? Only because the red end PSFs degrade rapidly...
+        # Gives prominent ringing in the output. are the PSFs too asymmetrical for block convolution to even be valid?
+        tile_size_x, tile_size_y = self.tile_size, self.tile_size
         # 1. During setup of the FieldOfViews
         if isinstance(obj, FovVolumeList) and self._waveset is not None:
             logger.debug("Executing %s, FoV setup", self.meta['name'])
@@ -524,11 +484,6 @@ class LSSDetectorPSF(GriddedPSF):
         elif isinstance(obj, self.convolution_classes):
             logger.debug("UVEX LSS detector PSF convolution start")
 
-            os_state = getattr(obj, "_oversampled", None)
-            if self.oversampling_x != 1 or self.oversampling_y != 1:
-                if os_state is None:
-                    raise ValueError("Either oversampling_x or oversampling_y is greater than 1, but the Oversampling effect has not been applied to the image yet; aborting.")
-            
             tile_size_x *= self.oversampling_x
             tile_size_y *= self.oversampling_y
             assert obj.hdu.data.ndim == 2, "Image should be mapped to detector plane but is not; check FOV creation." # should be mapped to the detector plane already

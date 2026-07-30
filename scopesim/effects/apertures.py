@@ -218,6 +218,8 @@ class UVEXSlitMask(ApertureMask):
             "crop_x": "!SIM.computing.crop_x",
             "crop_y": "!SIM.computing.crop_y",
             "crop_unit": "!SIM.computing.crop_unit",
+            "oversampling_x": "!SIM.computing.oversampling_x",
+            "oversampling_y": "!SIM.computing.oversampling_y",
             "fov_x0": "!INST.fov_x0",
             "fov_y0": "!INST.fov_y0",
             "fov_unit": "!INST.fov_unit",
@@ -269,6 +271,13 @@ class UVEXSlitMask(ApertureMask):
                 xmin, xmax = fov_xcen + crop_x[0], fov_xcen + crop_x[1]
             else:
                 xmin, xmax = min(x), max(x)
+            
+            oversampled_scale = from_currsys(self.meta["pixel_scale"], self.cmds) / self.meta["oversampling_x"] # already in arcsec
+            n_pix = int(round((xmax - xmin) / oversampled_scale))
+            if n_pix % 2 == 0:
+                n_pix += 1  # Force the oversampled pixel grid to be odd
+            half_width = 0.5 * n_pix * oversampled_scale
+            xmin, xmax = fov_xcen - half_width, fov_xcen + half_width
             if crop_y is not None:
                 ymin, ymax = fov_ycen + crop_y[0], fov_ycen + crop_y[1]
             else:

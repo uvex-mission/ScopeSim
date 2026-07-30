@@ -181,10 +181,19 @@ class SpectralTrace:
         det_header = fov.detector_header
 
         # WCSD from the FieldOfView - this is the full detector plane
-        pixsize = fov_header["CDELT1D"] * u.Unit(fov_header["CUNIT1D"])
-        pixsize = pixsize.to_value(u.mm)
-        pixscale = fov_header["CDELT1"] * u.Unit(fov_header["CUNIT1"])
-        pixscale = pixscale.to_value(u.arcsec)
+        # pixsize should align with dispersion axis (used for dlam_per_pix)
+        # pixscale should be the spatial axis, since this is the remaining per arcsec piece
+        # we need to integrate over after we find dlam_per_pix
+        if self.dispersion_axis == "x":
+            pixsize = fov_header["CDELT1D"] * u.Unit(fov_header["CUNIT1D"])
+            pixsize = pixsize.to_value(u.mm)
+            pixscale = fov_header["CDELT2"] * u.Unit(fov_header["CUNIT2"])
+            pixscale = pixscale.to_value(u.arcsec)
+        else: # default is y
+            pixsize = fov_header["CDELT2D"] * u.Unit(fov_header["CUNIT2D"])
+            pixsize = pixsize.to_value(u.mm)
+            pixscale = fov_header["CDELT1"] * u.Unit(fov_header["CUNIT1"])
+            pixscale = pixscale.to_value(u.arcsec)
 
         fpa_wcsd = WCS(det_header, key="D")
         naxis1d, naxis2d = det_header["NAXIS1"], det_header["NAXIS2"]
@@ -707,21 +716,21 @@ class XiLamImage():
         d_lam = fov.cube.header["CDELT3"]
         d_lam *= u.Unit(fov.cube.header["CUNIT3"]).to(u.um)
 
-        # This is based on the cube shape and assumes that the cube's spatial
-        # dimensions are set by the slit aperture
-        if fov.cube.data.shape[1] <= fov.cube.data.shape[2]:
+        # Auto-detect dispersion axis based on which axis has a greater physical length. THis is insensitive to oversampling
+        extent1 = (abs(fov.cube.header["CDELT1"]) * u.Unit(fov.cube.header["CUNIT1"]).to(u.arcsec)
+           * fov.cube.data.shape[2]) # physical extent along NAXIS1 or np axis 2
+        extent2 = (abs(fov.cube.header["CDELT2"]) * u.Unit(fov.cube.header["CUNIT2"]).to(u.arcsec)
+                * fov.cube.data.shape[1]) # physical extent along NAXIS2 or np axis 1
+        
+        if extent2 <= extent1:
             (n_lam, n_eta, n_xi) = fov.cube.data.shape
-            d_xi = fov.cube.header["CDELT1"]
-            d_xi *= u.Unit(fov.cube.header["CUNIT1"]).to(u.arcsec)
-            d_eta = fov.cube.header["CDELT2"]
-            d_eta *= u.Unit(fov.cube.header["CUNIT2"]).to(u.arcsec)
+            d_xi = fov.cube.header["CDELT1"] * u.Unit(fov.cube.header["CUNIT1"]).to(u.arcsec)
+            d_eta = fov.cube.header["CDELT2"] * u.Unit(fov.cube.header["CUNIT2"]).to(u.arcsec)
             wcs_xi = cube_wcs.sub([1])
-        elif fov.cube.data.shape[1] > fov.cube.data.shape[2]:
+        else:
             (n_lam, n_xi, n_eta) = fov.cube.data.shape
-            d_eta = fov.cube.header["CDELT1"]
-            d_eta *= u.Unit(fov.cube.header["CUNIT1"]).to(u.arcsec)
-            d_xi = fov.cube.header["CDELT2"]
-            d_xi *= u.Unit(fov.cube.header["CUNIT2"]).to(u.arcsec)
+            d_eta = fov.cube.header["CDELT1"] * u.Unit(fov.cube.header["CUNIT1"]).to(u.arcsec)
+            d_xi = fov.cube.header["CDELT2"] * u.Unit(fov.cube.header["CUNIT2"]).to(u.arcsec)
             wcs_xi = cube_wcs.sub([2])
 
         # arrays of cube coordinates
@@ -750,9 +759,9 @@ class XiLamImage():
             # lam0 is the target wavelength. We need to check that this
             # overlaps with the wavelength range covered by the cube
             if lam0.min() < cube_lam.max() and lam0.max() > cube_lam.min():
-                if fov.cube.data.shape[1] <= fov.cube.data.shape[2]:
+                if extent2 <= extent1:
                     plane = fov.cube.data[:, i, :].T
-                elif fov.cube.data.shape[1] > fov.cube.data.shape[2]:
+                else:
                     plane = fov.cube.data[:, :, i].T
                 plane_interp = RectBivariateSpline(cube_xi, cube_lam, plane,
                                                    kx=1, ky=1)
