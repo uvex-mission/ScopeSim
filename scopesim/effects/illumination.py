@@ -5,15 +5,17 @@ from typing import ClassVar
 from collections.abc import Callable, Mapping
 
 import numpy as np
+from scipy.ndimage import zoom
 from astropy import units as u
+from astropy.io import fits
 from astropy.modeling.functional_models import Gaussian2D
 
 from . import Effect
 from ..optics.image_plane import ImagePlane
 from ..utils import figure_factory
+from ..utils import find_file
 
-
-__all__ = ["Illumination", "gaussian2d", "quadratic_vignetting"]
+__all__ = ["Illumination", "FitsIllumination", "gaussian2d", "quadratic_vignetting"]
 
 
 def gaussian2d(
@@ -120,6 +122,207 @@ def quadratic_vignetting(
     return np.clip(1.0 - falloff * r2 / r2_ref, 0.0, 1.0)
 
 
+class FitsIllumination(Effect):
+    """
+    Image-plane illumination map loaded from a FITS file.
+
+    If the FITS map dimensions do not match the ScopeSim ImagePlane,
+    the map is resized using bilinear interpolation.
+
+    The illumination map is then applied by multiplying:
+
+        obj.hdu.data *= illumination_map
+    """
+
+    z_order: ClassVar[tuple[int, ...]] = (750,)
+
+    def __init__(
+        self,
+        filename: str,
+        normalize: bool = False,
+        interpolate: bool = True,
+        **kwargs,
+    ) -> None:
+
+        super().__init__(**kwargs)
+
+        self.meta.setdefault("include", "!DET.include_illumination")
+        self.meta["filename"] = filename
+        self.meta["normalize"] = normalize
+        self.meta["interpolate"] = interpolate
+
+        # Cached full-resolution map
+        self._map = None
+        self._map_shape = None
+
+    def apply_to(self, obj, **kwargs):
+        if not isinstance(obj, ImagePlane):
+            return obj
+
+        # Image arrays use shape = (ny, nx)
+        image_plane_shape = obj.hdu.data.shape
+
+        # Build the map only when needed
+        if self._map is None or image_plane_shape != self._map_shape:
+
+            print(
+                "FitsIllumination image-plane shape:",
+                image_plane_shape,
+            )
+
+            self._map = self._make_map(image_plane_shape)
+            self._map_shape = image_plane_shape
+
+        # Apply vignetting in place
+        obj.hdu.data *= self._map
+
+        return obj
+
+    def _make_map(self, target_shape):
+        """
+        Load the FITS illumination map and resize it when necessary.
+
+        Parameters
+        ----------
+        target_shape : tuple[int, int]
+            Required ScopeSim image-plane shape, given as (ny, nx).
+
+        Returns
+        -------
+        np.ndarray
+            Illumination map matching target_shape.
+        """
+
+        requested_filename = self.meta["filename"]
+        filename = find_file(requested_filename)
+
+        if filename is None:
+            raise FileNotFoundError(
+                "Could not locate illumination FITS file: "
+                f"{requested_filename}"
+            )
+
+        # Load the coarse FITS map as float32
+        illumination_map = fits.getdata(filename).astype(
+            np.float32,
+            copy=False,
+        )
+
+        if illumination_map.ndim != 2:
+            raise ValueError(
+                "Illumination FITS file must be 2D, "
+                f"got shape {illumination_map.shape}"
+            )
+
+        source_shape = illumination_map.shape
+        target_shape = tuple(int(value) for value in target_shape)
+
+#        print("FitsIllumination file:", filename)
+        print("FitsIllumination input-map shape:", source_shape)
+#        print("FitsIllumination required shape:", target_shape)
+
+        # ---------------------------------------------------------
+        # Resize only when the FITS map and image plane differ
+        # ---------------------------------------------------------
+        if source_shape != target_shape:
+
+            if not self.meta["interpolate"]:
+                raise ValueError(
+                    f"Illumination FITS shape {source_shape} does not "
+                    f"match image-plane shape {target_shape}, and "
+                    "interpolation is disabled."
+                )
+
+            # Shape ordering is (ny, nx), so the zoom factors are
+            # also ordered as (y factor, x factor).
+            zoom_factors = (
+                target_shape[0] / source_shape[0],
+                target_shape[1] / source_shape[1],
+            )
+
+            print("Interpolating illumination map:")
+#            print(f"  y zoom factor = {zoom_factors[0]:.8f}")
+#            print(f"  x zoom factor = {zoom_factors[1]:.8f}")
+
+            illumination_map = zoom(
+                illumination_map,
+                zoom=zoom_factors,
+                order=1,          # bilinear interpolation in 2D
+                mode="nearest",   # avoid artificial zero-valued borders
+                prefilter=False,
+                grid_mode=True,
+            )
+
+            illumination_map = np.asarray(
+                illumination_map,
+                dtype=np.float32,
+            )
+
+            # Confirm that SciPy produced exactly the required shape
+            if illumination_map.shape != target_shape:
+                raise RuntimeError(
+                    "Interpolation produced an unexpected shape: "
+                    f"{illumination_map.shape}; expected {target_shape}"
+                )
+
+            print(
+                "FitsIllumination interpolated shape:",
+                illumination_map.shape,
+            )
+
+        else:
+            print(
+                "FitsIllumination map already matches image plane; "
+                "no interpolation needed."
+            )
+
+        # ---------------------------------------------------------
+        # Optional normalization
+        # ---------------------------------------------------------
+        if self.meta["normalize"]:
+            maxval = np.nanmax(illumination_map)
+
+            if maxval > 0:
+                illumination_map = illumination_map / maxval
+        """
+        print("FitsIllumination final-map statistics:")
+        print("  min  =", np.nanmin(illumination_map))
+        print("  max  =", np.nanmax(illumination_map))
+        print("  mean =", np.nanmean(illumination_map))
+        print(
+            "  nans =",
+            np.count_nonzero(~np.isfinite(illumination_map)),
+        )
+        """
+        return illumination_map
+
+    def plot(self):
+        if self._map is None:
+            raise RuntimeError(
+                "No illumination map cached — run a simulation first."
+            )
+
+        fig, ax = figure_factory()
+
+        im = ax.imshow(
+            self._map,
+            origin="lower",
+            cmap="gray_r",
+        )
+
+        fig.colorbar(
+            im,
+            ax=ax,
+            label="Relative illumination",
+        )
+
+        ax.set_title("Fits Illumination")
+        ax.set_xlabel("x [px]")
+        ax.set_ylabel("y [px]")
+
+        return fig
+        
+
 class Illumination(Effect):
     """Large-scale illumination variation across the image plane.
 
@@ -179,6 +382,8 @@ class Illumination(Effect):
             return obj
 
         shape = obj.hdu.data.shape
+        print("illumination image-plane shape:", shape)
+
         if self._map is None or shape != self._map_shape:
             self._map = self._make_map(shape)
             self._map_shape = shape

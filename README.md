@@ -1,21 +1,17 @@
 # ScopeSim
 ## A telescope observation simulator for Python
 
-[![Build Status](https://github.com/AstarVienna/ScopeSim/actions/workflows/tests.yml/badge.svg)](https://github.com/AstarVienna/ScopeSim/actions/workflows/tests.yml/badge.svg)
-[![Build Status](https://github.com/AstarVienna/ScopeSim/actions/workflows/notebooks_with_irdb_download.yml/badge.svg)](https://github.com/AstarVienna/ScopeSim/actions/workflows/notebooks_with_irdb_download.yml/badge.svg)
-[![Poetry](https://img.shields.io/endpoint?url=https://python-poetry.org/badge/v0.json)](https://python-poetry.org/)
-![dev version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FAstarVienna%2FScopeSim%2Fmain%2Fpyproject.toml&query=%24.project.version&label=dev%20version&color=teal)
-
-[![Documentation Status](https://readthedocs.org/projects/scopesim/badge/?version=latest)](https://scopesim.readthedocs.io/en/latest)
-[![codecov](https://codecov.io/gh/AstarVienna/ScopeSim/graph/badge.svg)](https://codecov.io/gh/AstarVienna/ScopeSim)
-[![PyPI - Version](https://img.shields.io/pypi/v/ScopeSim)](https://pypi.org/project/ScopeSim/)
-![PyPI - Python Version](https://img.shields.io/pypi/pyversions/ScopeSim)
-![GitHub Release Date](https://img.shields.io/github/release-date/AstarVienna/ScopeSim)
-
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Citation](https://img.shields.io/badge/DOI-10.1117%2F12.2559784-blue)](https://doi.org/10.1117/12.2559784)
 
 ## Summary
+
+This is a modified UVEX fork of AstarVienna's ScopeSim package, containing custom Effects 
+and adjustments to support a UVEX instrument simulator. This is currently under development
+and should not be considered indicative of UVEX performance at this time.
+
+For more information about ScopeSim itself, see below and source repository here: [ScopeSim](https://github.com/AstarVienna/ScopeSim)
+
+## ScopeSim
 
 ScopeSim aims to simulate images of astronomical objects observed with visual
 and infrared instruments. It does this by creating models of the optical train
