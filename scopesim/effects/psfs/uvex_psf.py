@@ -3,7 +3,7 @@ from typing import ClassVar
 
 import numpy as np
 import os
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from scipy.signal import fftconvolve
 
 from astropy import units as u
@@ -629,7 +629,220 @@ class LSSDetectorPSF(GriddedPSF):
                 plt.show()
             
         return obj
-        
+
+class UVIMImagerPSF(GriddedPSF):
+    """Spatially varying detector-plane PSF for the UVIM NUV/FUV imagers."""
+
+    z_order: ClassVar[tuple[int, ...]] = (273, 673)
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("fov_unit", "arcsec")
+        super().__init__(**kwargs)
+
+        if self.psf_dir is None:
+            raise FileNotFoundError("UVIM PSF directory could not be found.")
+        if not self.psf_lib:
+            raise FileNotFoundError(f"No PSF FITS files found in {self.psf_dir}")
+
+        def _to_arcsec(value):
+            if isinstance(value, u.Quantity):
+                return value.to(u.arcsec)
+            unit = u.Unit(self.meta.get("fov_unit", "arcsec"))
+            return (float(value) * unit).to(u.arcsec)
+
+        self.fov_x0 = _to_arcsec(self.meta.get("fov_x0", 0.0))
+        self.fov_y0 = _to_arcsec(self.meta.get("fov_y0", 0.0))
+
+        arrs, positions, xpos_det, ypos_det = [], [], [], []
+
+        for psf_file in self.psf_lib:
+            with fits.open(os.path.join(self.psf_dir, psf_file)) as hdul:
+                arr = np.asarray(hdul[0].data, dtype=float)
+                hdr = hdul[0].header
+
+                if arr.ndim != 2:
+                    raise ValueError(
+                        f"{psf_file}: expected a 2D PSF, got shape {arr.shape}"
+                    )
+
+                arr_sum = np.nansum(arr)
+                if not np.isfinite(arr_sum) or arr_sum <= 0:
+                    raise ValueError(f"{psf_file}: invalid PSF sum {arr_sum}")
+
+                arrs.append(arr / arr_sum)
+                positions.append((
+                    (float(hdr["XFLD"]) * u.deg).to_value(u.arcsec),
+                    (float(hdr["YFLD"]) * u.deg).to_value(u.arcsec),
+                ))
+                xpos_det.append(float(hdr["XPOS"]))
+                ypos_det.append(float(hdr["YPOS"]))
+
+        if len(set(positions)) != len(positions):
+            raise ValueError(
+                "Duplicate XFLD/YFLD positions were found in the UVIM PSF library."
+            )
+
+        positions = np.asarray(positions)
+        sortidx = np.lexsort((positions[:, 0], positions[:, 1]))
+
+        self.psfs = [arrs[i] for i in sortidx]
+        self.grid_xypos = positions[sortidx]
+        self.xpos_det = np.asarray(xpos_det)[sortidx]
+        self.ypos_det = np.asarray(ypos_det)[sortidx]
+
+        self.x_vals = np.unique(self.grid_xypos[:, 0])
+        self.y_vals = np.unique(self.grid_xypos[:, 1])
+        self.x_min, self.x_max = self.x_vals.min(), self.x_vals.max()
+        self.y_min, self.y_max = self.y_vals.min(), self.y_vals.max()
+        self.max_psf_size = max(psf.shape[0] for psf in self.psfs)
+
+        n_expected = len(self.x_vals) * len(self.y_vals)
+        if n_expected != len(self.psfs):
+            raise ValueError(
+                f"Incomplete UVIM PSF grid in {self.psf_dir}: "
+                f"{len(self.psfs)} PSFs found, but "
+                f"{len(self.x_vals)} x-values × {len(self.y_vals)} y-values "
+                f"= {n_expected}"
+            )
+
+    @staticmethod
+    def _wcs_pixels_to_arcsec(sky_wcs, pixel_coordinates):
+        """Convert image pixel coordinates to WCS coordinates in arcsec."""
+        pixels = np.asarray(pixel_coordinates, dtype=float)
+        world = sky_wcs.all_pix2world(pixels, 0)
+
+        cunit_x = sky_wcs.wcs.cunit[0]
+        cunit_y = sky_wcs.wcs.cunit[1]
+        x_unit = u.arcsec if cunit_x is None or str(cunit_x) == "" else u.Unit(cunit_x)
+        y_unit = u.arcsec if cunit_y is None or str(cunit_y) == "" else u.Unit(cunit_y)
+
+        return np.column_stack((
+            (world[:, 0] * x_unit).to_value(u.arcsec),
+            (world[:, 1] * y_unit).to_value(u.arcsec),
+        ))
+
+    def apply_to(self, obj, tile_size_x=32, tile_size_y=32, **kwargs):
+        # During FOV setup
+        if isinstance(obj, FovVolumeList) and self._waveset is not None:
+            logger.debug("Executing %s, FoV setup", self.meta["name"])
+            if len(self._waveset) != 0:
+                waveset_edges = 0.5 * (self._waveset[:-1] + self._waveset[1:])
+                obj.split("wave", quantify(waveset_edges, u.um).value)
+
+        # During observation: spatially varying PSF convolution
+        elif isinstance(obj, self.convolution_classes):
+            logger.debug("UVIM imager PSF convolution start")
+
+            os_state = getattr(obj, "_oversampled", None)
+            if (self.oversampling_x != 1 or self.oversampling_y != 1) and os_state is None:
+                raise ValueError(
+                    "oversampling_x or oversampling_y is greater than 1, but "
+                    "ScopeSim's Oversampling effect has not yet been applied."
+                )
+
+            tile_size_x *= int(self.oversampling_x)
+            tile_size_y *= int(self.oversampling_y)
+
+            if obj.hdu.data.ndim != 2:
+                raise ValueError(
+                    f"UVIMImagerPSF expected a 2D image, "
+                    f"but received shape {obj.hdu.data.shape}"
+                )
+
+            image = obj.hdu.data.astype(float)
+            ydim, xdim = image.shape
+
+            n_tiles_y = ydim // tile_size_y + (ydim % tile_size_y != 0)
+            n_tiles_x = xdim // tile_size_x + (xdim % tile_size_x != 0)
+
+            bkg_level = get_bkg_level(image, self.meta["bkg_width"])
+            image -= bkg_level
+
+            sky_wcs = WCS(obj.hdu.header)
+            convolved_image = np.zeros_like(image)
+
+            with tqdm(
+                total=n_tiles_y * n_tiles_x,
+                desc=" UVIM Imager PSF Convolution",
+            ) as pbar:
+
+                for y in range(n_tiles_y):
+                    for x in range(n_tiles_x):
+                        y0, x0 = y * tile_size_y, x * tile_size_x
+                        y1 = min((y + 1) * tile_size_y, ydim)
+                        x1 = min((x + 1) * tile_size_x, xdim)
+
+                        y_cen = min(y0 + (y1 - y0) // 2, ydim - 1)
+                        x_cen = min(x0 + (x1 - x0) // 2, xdim - 1)
+
+                        x_fld0, y_fld0 = self._wcs_pixels_to_arcsec(
+                            sky_wcs, [[x_cen, y_cen]]
+                        )[0]
+
+                        x_fld0 += self.fov_x0.to_value(u.arcsec)
+                        y_fld0 += self.fov_y0.to_value(u.arcsec)
+
+                        x_fld0 = np.clip(x_fld0, self.x_min, self.x_max)
+                        y_fld0 = np.clip(y_fld0, self.y_min, self.y_max)
+
+                        ePSF = self._ePSF(x_fld0, y_fld0)
+                        pad_y, pad_x = ePSF.shape[0] - 1, ePSF.shape[1] - 1
+
+                        orig_tile = image[y0:y1, x0:x1]
+
+                        if orig_tile.shape != (tile_size_y, tile_size_x):
+                            tile = np.pad(
+                                orig_tile,
+                                (
+                                    (0, tile_size_y - orig_tile.shape[0]),
+                                    (0, tile_size_x - orig_tile.shape[1]),
+                                ),
+                                mode="constant",
+                                constant_values=0.0,
+                            )
+                        else:
+                            tile = orig_tile
+
+                        padded_tile = np.pad(
+                            tile,
+                            ((pad_y, pad_y), (pad_x, pad_x)),
+                            mode="constant",
+                            constant_values=0.0,
+                        )
+                        convolved_tile = fftconvolve(padded_tile, ePSF, mode="same")
+
+                        g_y0, g_y1 = y0 - pad_y, y0 + tile_size_y + pad_y
+                        g_x0, g_x1 = x0 - pad_x, x0 + tile_size_x + pad_x
+
+                        cminy, cmaxy = max(0, g_y0), min(ydim, g_y1)
+                        cminx, cmaxx = max(0, g_x0), min(xdim, g_x1)
+
+                        start_y, start_x = cminy - g_y0, cminx - g_x0
+                        end_y = start_y + (cmaxy - cminy)
+                        end_x = start_x + (cmaxx - cminx)
+
+                        convolved_image[cminy:cmaxy, cminx:cmaxx] += (
+                            convolved_tile[start_y:end_y, start_x:end_x]
+                        )
+
+                        pbar.update(1)
+
+            img_sum = image.sum()
+            conv_sum = convolved_image.sum()
+
+            if np.isfinite(img_sum) and img_sum != 0:
+                rel_diff = np.abs(img_sum - conv_sum) / np.abs(img_sum)
+                if rel_diff > self.meta["flux_accuracy"]:
+                    logger.warning(
+                        "Flux is not conserved by UVIM imager PSF convolution: "
+                        "difference is %.2f%%",
+                        rel_diff * 100,
+                    )
+
+            obj.hdu.data = convolved_image + bkg_level
+
+        return obj
+                
 def find_directory(dir_name, search_root=irdb_path):
     """Find directory by name and return its absolute path."""
     if dir_name is None:
