@@ -82,7 +82,7 @@ def _make_bounding_header_from_headers(*headers, pixel_scale=1*u.arcsec):
     Parameters
     ----------
     headers : list of fits.ImageHDU
-    pixel_scale : u.Quantity
+    pixel_scale : u.Quantity or np.array of U.Quantity with shape (2,)
         [arcsec]
 
     Returns
@@ -99,6 +99,9 @@ def _make_bounding_header_from_headers(*headers, pixel_scale=1*u.arcsec):
     else:
         pixel_scale = pixel_scale.to_value(unit)
 
+    if pixel_scale.size == 1:
+        pixel_scale = np.repeat(pixel_scale, 2)
+
     extents = [calc_footprint(header, wcs_suffix, unit) for header in headers]
     pnts = np.vstack(extents)
 
@@ -106,8 +109,8 @@ def _make_bounding_header_from_headers(*headers, pixel_scale=1*u.arcsec):
                                  pixel_scale, wcs_suffix)
     hdr["NAXIS1"] += 1
     hdr["NAXIS2"] += 1
-    hdr[f"CRVAL1{wcs_suffix}"] -= 0.5 * pixel_scale
-    hdr[f"CRVAL2{wcs_suffix}"] -= 0.5 * pixel_scale
+    hdr[f"CRVAL1{wcs_suffix}"] -= 0.5 * pixel_scale[0]
+    hdr[f"CRVAL2{wcs_suffix}"] -= 0.5 * pixel_scale[1]
 
     return hdr
 
@@ -155,7 +158,7 @@ def _make_bounding_header_for_tables(*tables, pixel_scale=1*u.arcsec):
 
 
 def create_wcs_from_points(points: np.ndarray,
-                           pixel_scale: float,
+                           pixel_scale: float | np.ndarray,
                            wcs_suffix: str = "") -> tuple[WCS, np.ndarray]:
     """
     Create `astropy.wcs.WCS` instance that fits all points inside.
@@ -164,7 +167,7 @@ def create_wcs_from_points(points: np.ndarray,
     ----------
     corners : (N, 2) array
         2D array of N >= 2 points in the form of [x, y].
-    pixel_scale : float
+    pixel_scale : float or np.array of shape (2,)
         DESCRIPTION.
     wcs_suffix : str, optional
         DESCRIPTION. The default is "".
@@ -184,7 +187,15 @@ def create_wcs_from_points(points: np.ndarray,
         points = _fix_360(points)
 
     # TODO: test whether abs(pixel_scale) breaks anything
-    pixel_scale = abs(pixel_scale)
+    pixel_scale = pixel_scale if isinstance(pixel_scale, u.Quantity) else np.asarray(pixel_scale, dtype=float)
+
+    if pixel_scale.size == 1:
+        pixel_scale = np.abs(np.repeat(pixel_scale, points.shape[1]))
+    elif pixel_scale.size == 2:
+        pixel_scale = np.abs(pixel_scale)
+    else:
+        raise ValueError(f"pixel_scale must have size 1 or 2, got {pixel_scale.size}")
+
     extent = np.ptp(points, axis=0) / pixel_scale
     naxis = extent.round().astype(int)
     ndims = len(naxis)
@@ -236,7 +247,7 @@ def create_wcs_from_points(points: np.ndarray,
     new_wcs = WCS(key=wcs_suffix, naxis=ndims)
     new_wcs.wcs.ctype = ctype
     new_wcs.wcs.cunit = ndims * [cunit]
-    new_wcs.wcs.cdelt = np.array(ndims * [pixel_scale])
+    new_wcs.wcs.cdelt = np.asarray(pixel_scale)
     new_wcs.wcs.crval = crval
     new_wcs.wcs.crpix = crpix
 
@@ -251,7 +262,7 @@ def header_from_list_of_xy(x, y, pixel_scale, wcs_suffix="", arcsec=False):
     ----------
     x, y : list of floats
         [deg, mm] List of sky coordinates to be bounded by the NAXISn keys
-    pixel_scale : float
+    pixel_scale : float or np.array of shape (2,)
         [deg, mm]
 
     Returns
@@ -263,7 +274,9 @@ def header_from_list_of_xy(x, y, pixel_scale, wcs_suffix="", arcsec=False):
 
     if arcsec:
         points <<= u.arcsec
-        pixel_scale <<= u.arcsec / u.pixel
+        pixel_scale = np.atleast_1d(pixel_scale)
+        if not isinstance(pixel_scale, u.Quantity):
+            pixel_scale = pixel_scale << (u.arcsec / u.pixel)
 
     new_wcs, naxis = create_wcs_from_points(points, pixel_scale, wcs_suffix)
 
@@ -475,7 +488,7 @@ def overlay_image(small_im, big_im, coords, mask=None, sub_pixel=False):
     return big_im
 
 
-def rescale_imagehdu(imagehdu: fits.ImageHDU, pixel_scale: float | u.Quantity,
+def rescale_imagehdu(imagehdu: fits.ImageHDU, pixel_scale: float | u.Quantity | np.ndarray,
                      wcs_suffix: str = "", conserve_flux: bool = True,
                      spline_order: int = 1) -> fits.ImageHDU:
     """
@@ -486,7 +499,7 @@ def rescale_imagehdu(imagehdu: fits.ImageHDU, pixel_scale: float | u.Quantity,
     Parameters
     ----------
     imagehdu : fits.ImageHDU
-    pixel_scale : float or Quantity
+    pixel_scale : float, Quantity or array of shape (2,)
         the desired pixel scale of the scaled ImageHDU, as applicable to the WCS
         identified by `wcs_suffix` (by default " "). If float the units are assumed
         to be the same as CUNITa; if a Quantity, the unit need to be convertible.
@@ -579,6 +592,22 @@ def rescale_imagehdu(imagehdu: fits.ImageHDU, pixel_scale: float | u.Quantity,
         imagehdu.header.update(ww.to_header())
 
     return imagehdu
+
+
+def _oversample_header(hdr, factor_1, factor_2, wcs_suffix="D"):
+    """Rescale the WCS/NAXIS parameters in an image plane header to reflect oversampling by some factors."""
+    hdr = hdr.copy()
+    s = wcs_suffix
+    for ax, factor in (("1", factor_1), ("2", factor_2)):
+        hdr[f"NAXIS{ax}"] = int(round(hdr[f"NAXIS{ax}"] * factor))
+        if (crpix_key := f"CRPIX{ax}{s}") in hdr:
+            hdr[crpix_key] = (hdr[crpix_key] - 0.5) * factor + 0.5
+        if (cdelt_key := f"CDELT{ax}{s}") in hdr:
+            hdr[cdelt_key] /= factor
+    for (i, fi), (j, fj) in product((("1", factor_1), ("2", factor_2)), repeat=2):
+        if (cd_key := f"CD{i}_{j}{s}") in hdr:
+            hdr[cd_key] /= (fi if i == j else np.sqrt(fi * fj))
+    return hdr
 
 
 def reorient_imagehdu(imagehdu: fits.ImageHDU, wcs_suffix: str = "",
@@ -973,7 +1002,7 @@ def calc_table_footprint(table: Table, x_name: str, y_name: str,
         Default unit to use for x and y if no units are found in `table`.
     new_unit : str
         Unit to convert x and y to, can be identical to `tbl_unit`.
-    padding : astropy.units.Quantity, optional
+    padding : astropy.units.Quantity or np.array of shape (2,), optional
         Constant value to subtract from minima and add to maxima. If used, must
         be Quantity with same physical type as x and y. If None (default), no
         padding is added.
@@ -987,9 +1016,11 @@ def calc_table_footprint(table: Table, x_name: str, y_name: str,
 
     """
     if padding is not None:
-        padding = padding.to_value(new_unit)
+        padding = np.atleast_1d(padding.to_value(new_unit))
+        if padding.size == 1:
+            padding = np.repeat(padding, 2)
     else:
-        padding = 0.
+        padding = np.zeros(2)
 
     x_convf = unit_from_table(x_name, table, tbl_unit).to(new_unit)
     y_convf = unit_from_table(y_name, table, tbl_unit).to(new_unit)
@@ -997,10 +1028,10 @@ def calc_table_footprint(table: Table, x_name: str, y_name: str,
     x_col = table[x_name] * x_convf
     y_col = table[y_name] * y_convf
 
-    x_min = x_col.min() - padding
-    x_max = x_col.max() + padding
-    y_min = y_col.min() - padding
-    y_max = y_col.max() + padding
+    x_min = x_col.min() - padding[0]
+    x_max = x_col.max() + padding[0]
+    y_min = y_col.min() - padding[1]
+    y_max = y_col.max() + padding[1]
 
     extent = np.array([[x_min, y_min],
                        [x_min, y_max],

@@ -91,10 +91,34 @@ class FOVManager:
             "preload_fovs": "!SIM.computing.preload_field_of_views",
             "decouple_sky_det_hdrs": "!INST.decouple_detector_from_sky_headers",
             "aperture_id": 0,
+            "oversampling_x": "!SIM.computing.oversampling_x",
+            "oversampling_y": "!SIM.computing.oversampling_y",
+            "psf_oversampling": "!SIM.computing.psf_oversampling",
+            "flux_accuracy": "!SIM.computing.flux_accuracy",
         }
         self.meta.update(kwargs)
         self.cmds = cmds
 
+        self.oversampling_x = from_currsys(self.meta["oversampling_x"], self.cmds)
+        self.oversampling_y = from_currsys(self.meta["oversampling_y"], self.cmds)
+        self.psf_oversampling = from_currsys(self.meta["psf_oversampling"], self.cmds)
+        self.flux_accuracy = from_currsys(self.meta["flux_accuracy"], self.cmds)
+
+        assert self.oversampling_x > 0, "Oversampling factor must be greater than 0."
+        assert self.oversampling_y > 0, "Oversampling factor must be greater than 0."
+        assert self.psf_oversampling > 0, "PSF oversampling factor must be greater than 0."
+       
+        # oversampling should be a multiple of 2 (because of constraints in the x direction), and both should be divisble by 10 if the UVEXSlitPSF effect is applied
+        if self.oversampling_x % 2 != 0:
+            logger.warning("For use with the UVEX Slit Mask effect, it's recommended that oversampling_x is even.")
+        if self.psf_oversampling % self.oversampling_x != 0 or self.psf_oversampling % self.oversampling_y != 0:
+            logger.warning("Both oversampling factors must divide into the oversampling factor of the UVEX PSFs if any of the UVEX PSF effects are used.")
+        
+        self.native_pixel_scale = from_currsys(self.meta["pixel_scale"], self.cmds)
+        self.oversampled_pixel_scale = np.array([
+            self.native_pixel_scale / self.oversampling_x,
+            self.native_pixel_scale / self.oversampling_y,
+        ])
         params = from_currsys({"wave_min": self.meta["wave_min"],
                                "wave_max": self.meta["wave_max"]},
                               self.cmds)
@@ -115,18 +139,22 @@ class FOVManager:
     def _get_splits(self, pixel_scale):
         chunk_size = from_currsys(self.meta["chunk_size"], self.cmds)
         max_seg_size = from_currsys(self.meta["max_segment_size"], self.cmds)
+        pixel_scale = np.atleast_1d(pixel_scale)
+        if pixel_scale.size == 1:
+            pixel_scale = np.repeat(pixel_scale, 2)
 
         for vol in self.volumes_list:
             vol_pix_area = ((vol["x_max"] - vol["x_min"]) *
-                            (vol["y_max"] - vol["y_min"]) / pixel_scale**2)
+                            (vol["y_max"] - vol["y_min"]) / (pixel_scale[0]*pixel_scale[1]))
             if vol_pix_area > max_seg_size:
-                step = chunk_size * pixel_scale
+                step_x = chunk_size * pixel_scale[0]
+                step_y = chunk_size * pixel_scale[1]
 
                 # These are not always integers, unlike in the tests.
                 # See for example HAWKI/test_hawki/test_full_package_hawki.py.
                 # The np.arange can therefore not be changed to just a range.
-                yield (np.arange(vol["x_min"], vol["x_max"], step),
-                       np.arange(vol["y_min"], vol["y_max"], step))
+                yield (np.arange(vol["x_min"], vol["x_max"], step_x),
+                    np.arange(vol["y_min"], vol["y_max"], step_y))
 
     def generate_fovs_list(self) -> Iterator[FieldOfView]:
         """
@@ -148,7 +176,7 @@ class FOVManager:
             self.volumes_list = effect.apply_to(self.volumes_list, **params)
 
         # ..todo: add catch to split volumes larger than chunk_size
-        pixel_scale = from_currsys(self.meta["pixel_scale"], self.cmds)
+        pixel_scale = self.oversampled_pixel_scale
         plate_scale = from_currsys(self.meta["plate_scale"], self.cmds)
 
         splits = (chain.from_iterable(split)
@@ -173,7 +201,10 @@ class FOVManager:
             # TODO: Make sure this changes for multiple image planes
             if from_currsys(self.meta["decouple_sky_det_hdrs"], self.cmds):
                 det_eff = eu.get_all_effects(self.effects, DetectorList)[0]
-                dethdr = det_eff.image_plane_header
+                if self.oversampling_x != 1 or self.oversampling_y != 1:
+                    dethdr = ipu._oversample_header(det_eff.image_plane_header, self.oversampling_x, self.oversampling_y)
+                else:    
+                    dethdr = det_eff.image_plane_header
                 # TODO: Why is this .image_plane_header and not
                 #       .detector_headers()[0] or something?
 
