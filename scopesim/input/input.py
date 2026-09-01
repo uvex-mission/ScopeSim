@@ -54,15 +54,17 @@ class UVEXInput:
     def __init__(self,
                  observation_coordinates: SkyCoord,
                  observation_time: astropy.time.Time,
+                 mode: str,
                  use_background: bool,
                  point_sources_from_spectra: astropy.table.QTable = None,
                  point_sources_from_magnitude: astropy.table.QTable = None,
                  patches: astropy.table.QTable = None,
-                 spectra: astropy.table.QTable = None):
+                 spectra: dict[str, SourceSpectrum] = None):
 
         """
         :param observation_coordinates: The SkyCoord object describing where the observation takes place.
         :param observation_time: An astropy.time.Time object describing when the observation takes place.
+        :param mode: One of "fuv", "nuv" or "spectrograph"
         :param use_background: A boolean value indicating whether to generate a background from the observation coordinates and time.
         :param point_sources_from_spectra: An astropy QTable of point sources with spectra given in the spectra parameter.
         The columns must be "ra", "dec", "ref" (string reference to the spectrum in spectra), and scale which is a scalar value multiplying the referenced spectrum.
@@ -76,6 +78,9 @@ class UVEXInput:
 
 
         """
+
+        if not mode in ["fuv", "nuv", "spectrograph"]:
+            raise Exception("Valid modes are 'fuv', 'nuv', 'spectrograph'")
 
         if not isinstance(use_background, bool):
             raise TypeError("use_background must be a boolean value.")
@@ -114,6 +119,7 @@ class UVEXInput:
 
         self.observation_coordinates = observation_coordinates
         self.observation_time = observation_time
+        self.mode = mode
         self.use_background = use_background
         self.point_sources_from_spectra = point_sources_from_spectra
         self.point_sources_from_magnitude = point_sources_from_magnitude
