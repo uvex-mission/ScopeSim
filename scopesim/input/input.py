@@ -6,10 +6,8 @@ import numpy as np
 import astropy.table
 import synphot.units
 from astropy.coordinates import SkyCoord
-from contourpy.types import point_dtype
 from synphot import SourceSpectrum, BlackBodyNorm1D
 from astropy.io import fits
-import astropy.units as u
 import warnings
 
 class UVEXInput:
@@ -31,7 +29,7 @@ class UVEXInput:
     Third, there are FITS files containing images.
     These can be found in the patches table, which also contains position information (ra, dec) for each FITS image.
     The table contains paths (path column) and also spectral references (ref) which are strings that match spectra dictionary keys.
-
+    We assume that the data is in the primary HDU
 
     Object attributes after validation functions:
 
@@ -48,7 +46,7 @@ class UVEXInput:
         All FITS headers are ignored (except the basic ones) and we take the position information from the table "ra" and "dec" values
         7. spectra: A dictionary with string keys that match "ref" values in astropy tables. The values are synphot SourceSpectrum objects.
 
-
+        TODO: I can add an input for extinction when it is decided how the user will specify it
     '''
     def __new__(cls, *args, **kwargs):
         return super().__new__(cls)
@@ -87,7 +85,7 @@ class UVEXInput:
                                            ["ra", "dec", "ref", "scale"], #expected headers
                                            [float, float, str, float], #expected column data types
                                            [0,1], #header indexes which correspond to columns that must have units
-                                           [" point_sources_from_spectrum table"], #table name to show in error messages
+                                           " point_sources_from_spectrum table", #table name to show in error messages
                                            2) #header index of data column to return to compare
 
         patch_refs = self.table_validation(patches,
@@ -101,7 +99,7 @@ class UVEXInput:
                               ["ra", "dec", "mag"],
                               [float, float, float],
                               [0, 1, 2],
-                              [" point_sources_from_magnitude table"],
+                              " point_sources_from_magnitude table",
                               None)
 
         self.validate_observation_coordinates(observation_coordinates, observation_time)
@@ -136,10 +134,10 @@ class UVEXInput:
     @staticmethod
     def table_validation(table: astropy.table.QTable,
                          headers: list[str],
-                         types: list[str],
+                         types: list[type],
                          headers_with_units: list[int],
                          debug_name: str,
-                         ref_index: int or None ):
+                         ref_index):
         """
         Checks:
         1. table is None or an Astropy QTable with no masking and units
@@ -203,10 +201,6 @@ class UVEXInput:
     @staticmethod
     def validate_fits(fits_paths: list[str]):
         """
-        TODO: Should we assume user data is in the primary HDU or should we take an HDU number as input.
-        If we allow the data to be in an HDU other than the primary we must check to ensure it is an image extension.
-        It seems as though there is no need to check that the primary HDU is not a Table etc.
-
         Checks:
         1. Each path opens as a fits file
         :param fits_paths: list of paths to FITS files
@@ -338,7 +332,7 @@ def examples():
     constant_good_table = astropy.table.QTable(names=["ra", "dec", "mag"], dtype=('f4', 'f4','f4'))
     constant_good_table.add_row((2.0, 3.0, 0.5))
     constant_good_table.add_row((6.0, 2.0, 0.9))
-    constant_good_table.units = [astropy.units.deg, astropy.units.deg, astropy.units.deg]
+    constant_good_table.units = [astropy.units.deg, astropy.units.deg, synphot.units.PHOTLAM]
 
 
 
