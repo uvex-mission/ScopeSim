@@ -7,4 +7,4 @@ from .analytical import (Vibration, NonCommonPathAberration, SeeingPSF,
                          GaussianDiffractionPSF, SpacecraftPointing)
 from .semianalytical import AnisocadoConstPSF
 from .discrete import FieldConstantPSF, FieldVaryingPSF
-from .uvex_psf import GriddedPSF, SlitPSF, LSSDetectorPSF
+from .uvex_psf import GriddedPSF, SlitPSF, LSSDetectorPSF, UVIMImagerPSF
