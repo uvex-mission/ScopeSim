@@ -5,10 +5,12 @@ from typing import ClassVar
 
 import numpy as np
 from astropy.io import fits
+from pathlib import Path
+import yaml
 
 from .. import Effect
 from ...detector import Detector
-from ...utils import from_currsys, figure_factory, check_keys, real_colname
+from ...utils import from_currsys, figure_factory, check_keys, real_colname, find_file
 from . import logger
 
 
@@ -32,6 +34,89 @@ class Bias(Effect):
         obj._hdu.data = obj._hdu.data + biaslevel
 
         return obj
+
+
+class BiasMap(Effect):
+    """Add detector-specific pixel-dependent electronic bias."""
+
+    required_keys = {"calibration_config"}
+    z_order: ClassVar[tuple[int, ...]] = (820,)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.meta.update(kwargs)
+
+        check_keys(self.meta, self.required_keys, action="error")
+
+    def apply_to(self, det, **kwargs):
+        """Apply detector-specific pixel-dependent bias."""
+
+        if not isinstance(det, Detector):
+            return det
+
+        # Identify the physical detector (A1, A2, ..., C3)
+        detector_name = det._hdu.header.get("NAME")
+
+        if detector_name is None:
+            raise ValueError(
+                "Detector header does not contain NAME; "
+                "cannot select detector-specific bias calibration."
+            )
+
+        # Locate the detector calibration configuration
+        config_filename = from_currsys(
+            self.meta["calibration_config"], self.cmds
+        )
+        config_path = find_file(config_filename)
+
+        if config_path is None:
+            raise FileNotFoundError(
+                f"Could not find calibration config: {config_filename}"
+            )
+
+        config_path = Path(config_path)
+
+        # Read the detector calibration configuration
+        with open(config_path, "r") as f:
+            calibration_config = yaml.safe_load(f)
+
+        # Get the bias map for this detector
+        try:
+            bias_filename = (
+                calibration_config["detectors"]
+                [detector_name]
+                ["bias"]
+            )
+        except KeyError as exc:
+            raise KeyError(
+                f"No bias calibration defined for "
+                f"detector {detector_name}"
+            ) from exc
+
+        # Calibration paths are relative to the config file
+        bias_path = config_path.parent / bias_filename
+
+        if not bias_path.exists():
+            raise FileNotFoundError(
+                f"Bias calibration not found for "
+                f"{detector_name}: {bias_path}"
+            )
+
+        # Load the per-pixel bias map
+        bias_map = fits.getdata(bias_path)
+
+        if bias_map.shape != det._hdu.data.shape:
+            raise ValueError(
+                f"Bias map for {detector_name} has shape "
+                f"{bias_map.shape}, but detector has shape "
+                f"{det._hdu.data.shape}."
+            )
+
+        # Add electronic bias offset
+        det._hdu.data = det._hdu.data + bias_map
+
+        return det
 
 
 class PoorMansHxRGReadoutNoise(Effect):
@@ -136,6 +221,107 @@ class BasicReadoutNoise(Effect):
         dtcr = self.apply_to(det)
         fig, ax = figure_factory()
         ax.hist(dtcr.data.flatten())
+
+
+
+
+
+class BasicReadoutNoiseMap(Effect):
+    """Add pixel-dependent Gaussian read noise from detector-specific RMS maps."""
+
+    required_keys = {"calibration_config", "ndit"}
+    z_order: ClassVar[tuple[int, ...]] = (811,)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.meta["random_seed"] = "!SIM.random.seed"
+        self.meta.update(kwargs)
+
+        check_keys(self.meta, self.required_keys, action="error")
+
+        # Initialize one RNG for all detector readouts
+        random_seed = from_currsys(
+            self.meta["random_seed"], self.cmds
+        )
+        self._rng = np.random.default_rng(random_seed)
+
+    def apply_to(self, det, **kwargs):
+        """Apply detector-specific pixel-dependent read noise."""
+
+        if not isinstance(det, Detector):
+            return det
+
+        # Identify the physical detector (A1, A2, ..., C3)
+        detector_name = det._hdu.header.get("NAME")
+
+        if detector_name is None:
+            raise ValueError(
+                "Detector header does not contain NAME; "
+                "cannot select detector-specific read-noise calibration."
+            )
+
+        # Locate the detector calibration configuration
+        config_filename = from_currsys(
+            self.meta["calibration_config"], self.cmds
+        )
+        config_path = find_file(config_filename)
+
+        if config_path is None:
+            raise FileNotFoundError(
+                f"Could not find calibration config: {config_filename}"
+            )
+
+        config_path = Path(config_path)
+
+        # Read the detector calibration configuration
+        with open(config_path, "r") as f:
+            calibration_config = yaml.safe_load(f)
+
+        # Get the read-noise map for this detector
+        try:
+            read_noise_filename = (
+                calibration_config["detectors"]
+                [detector_name]
+                ["read_noise"]
+            )
+        except KeyError as exc:
+            raise KeyError(
+                f"No read-noise calibration defined for "
+                f"detector {detector_name}"
+            ) from exc
+
+        # Calibration paths are relative to the config file
+        read_noise_path = config_path.parent / read_noise_filename
+
+        if not read_noise_path.exists():
+            raise FileNotFoundError(
+                f"Read-noise calibration not found for "
+                f"{detector_name}: {read_noise_path}"
+            )
+
+        # Load the per-pixel read-noise RMS map
+        read_noise_map = fits.getdata(read_noise_path)
+
+        if read_noise_map.shape != det._hdu.data.shape:
+            raise ValueError(
+                f"Read-noise map for {detector_name} has shape "
+                f"{read_noise_map.shape}, but detector has shape "
+                f"{det._hdu.data.shape}."
+            )
+
+        # Scale RMS for multiple independent reads
+        ndit = from_currsys(self.meta["ndit"], self.cmds)
+        noise_std = read_noise_map * np.sqrt(float(ndit))
+
+        # Draw and add an independent noise realization
+        det._hdu.data = det._hdu.data + self._rng.normal(
+            loc=0,
+            scale=noise_std,
+            size=det._hdu.data.shape,
+        )
+
+        return det
 
 
 # TODO: Is this really a "noise" effect? Sounds more like "electrons" tbh.
@@ -347,6 +533,99 @@ class DarkCurrent(Effect):
         ax.plot(times, levels, **kwargs)
         ax.set_xlabel("time")
         ax.set_ylabel("dark level")
+
+
+class DarkCurrentMap(Effect):
+    """Add detector-specific pixel-dependent dark current."""
+
+    required_keys = {"calibration_config", "dit", "ndit"}
+    z_order: ClassVar[tuple[int, ...]] = (830,)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.meta.update(kwargs)
+
+        check_keys(self.meta, self.required_keys, action="error")
+
+    def apply_to(self, det, **kwargs):
+        """Apply detector-specific pixel-dependent dark current."""
+
+        if not isinstance(det, Detector):
+            return det
+
+        # Identify the physical detector (A1, A2, ..., C3)
+        detector_name = det._hdu.header.get("NAME")
+
+        if detector_name is None:
+            raise ValueError(
+                "Detector header does not contain NAME; "
+                "cannot select detector-specific dark-current calibration."
+            )
+
+        # Locate the detector calibration configuration
+        config_filename = from_currsys(
+            self.meta["calibration_config"], self.cmds
+        )
+        config_path = find_file(config_filename)
+
+        if config_path is None:
+            raise FileNotFoundError(
+                f"Could not find calibration config: {config_filename}"
+            )
+
+        config_path = Path(config_path)
+
+        # Read the detector calibration configuration
+        with open(config_path, "r") as f:
+            calibration_config = yaml.safe_load(f)
+
+        # Get the dark-current map for this detector
+        try:
+            dark_current_filename = (
+                calibration_config["detectors"]
+                [detector_name]
+                ["dark_current"]
+            )
+        except KeyError as exc:
+            raise KeyError(
+                f"No dark-current calibration defined for "
+                f"detector {detector_name}"
+            ) from exc
+
+        # Calibration paths are relative to the config file
+        dark_current_path = config_path.parent / dark_current_filename
+
+        if not dark_current_path.exists():
+            raise FileNotFoundError(
+                f"Dark-current calibration not found for "
+                f"{detector_name}: {dark_current_path}"
+            )
+
+        # Load the per-pixel dark-current rate map [e-/pixel/s]
+        dark_current_map = fits.getdata(dark_current_path)
+
+        if dark_current_map.shape != det._hdu.data.shape:
+            raise ValueError(
+                f"Dark-current map for {detector_name} has shape "
+                f"{dark_current_map.shape}, but detector has shape "
+                f"{det._hdu.data.shape}."
+            )
+
+        # Convert dark-current rate to accumulated dark charge
+        dit = from_currsys(self.meta["dit"], self.cmds)
+        ndit = from_currsys(self.meta["ndit"], self.cmds)
+
+        dark_signal = (
+            dark_current_map
+            * float(dit)
+            * float(ndit)
+        )
+
+        # Add dark signal to detector
+        det._hdu.data = det._hdu.data + dark_signal
+
+        return det
 
 
 def _pseudo_random_field(scale=1, size=(1024, 1024)):
